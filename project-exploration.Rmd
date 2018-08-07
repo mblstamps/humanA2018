@@ -1,0 +1,282 @@
+---
+title: "Project exploration"
+output: html_notebook
+---
+
+## Load library and read list of files
+
+```{r}
+library(dada2); packageVersion("dada2")
+
+# NOTE: change to the appropriate path on your computer where the raw data lives
+# downloaded raw data in `fastq` format
+path <- "/Users/caseygrun/Documents/Research/STAMPS/project/data" # "../../project/data/"
+
+# download taxonomy training data from
+# https://zenodo.org/record/1172783/files/silva_nr_v132_train_set.fa.gz?download=1
+# put the absolute path to that file here:
+taxonomy_train_path <- "/Users/caseygrun/Documents/Research/STAMPS/R/STAMPS/2018-08-01-dada2/data/taxa/silva_nr_v132_train_set.fa.gz"
+
+# also download
+# https://zenodo.org/record/1172783/files/silva_species_assignment_v132.fa.gz?download=1
+# for species assignment, and put the absolute path to that file here:
+taxonomy_species_path <- "/Users/caseygrun/Documents/Research/STAMPS/R/STAMPS/2018-08-01-dada2/data//taxa/silva_species_assignment_v132.fa.gz"
+
+# if you want to skip the analysis below, run this command to load the results
+load(file.path(path, "analysis", "analysis.Rdata"))
+```
+
+```{r}
+# Forward and reverse fastq filenames have format: 
+# ACCESSION_1.fastq and
+# ACCESSION_2.fastq
+fnFs <- sort(list.files(path, pattern="_1.fastq", full.names = TRUE))
+fnRs <- sort(list.files(path, pattern="_2.fastq", full.names = TRUE))
+# Extract sample names, assuming filenames have format: SAMPLENAME_XXX.fastq
+sample.names <- sapply(strsplit(basename(fnFs), "_"), `[`, 1)
+```
+
+## Inspect read quality profiles
+```{r}
+# visualize the quality profiles of the forward and reverse reads 
+# for the first two samples:
+plotQualityProfile(fnFs[2:10])
+```
+
+```{r}
+plotQualityProfile(fnRs[2:10])
+```
+
+## Filter and trim
+```{r}
+# Place filtered files in filtered/ subdirectory
+filtFs <- file.path(path, "filtered", paste0(sample.names, "_F_filt.fastq.gz"))
+filtRs <- file.path(path, "filtered", paste0(sample.names, "_R_filt.fastq.gz"))
+
+# We’ll use standard filtering parameters: maxN=0 (DADA2 requires no Ns),
+# truncQ=2, rm.phix=TRUE and maxEE=2. The maxEE parameter sets the maximum
+# number of “expected errors” allowed in a read, which is a better filter than
+# simply averaging quality scores.
+out <- filterAndTrim(fnFs, filtFs, fnRs, filtRs, truncLen=c(240,160),
+                     maxN=0, maxEE=c(2,2), truncQ=2, rm.phix=TRUE,
+                     compress=TRUE, multithread=TRUE)
+```
+
+## Learn the Error Rates
+
+learn forward error rates
+```{r}
+# learn the errors on each sequence, starting with an initial guess that only the
+# most abundant sequence is correct, and using the expectation-minimization algorithm
+errF <- learnErrors(filtFs, multithread=TRUE)
+```
+
+learn reverse error rates
+```{r}
+errR <- learnErrors(filtRs, multithread=TRUE)
+```
+
+Plot error frequency
+
+```{r}
+# plot the error frequency
+plotErrors(errF, nominalQ=TRUE)
+```
+
+
+## Dereplication
+```{r}
+derepFs <- derepFastq(filtFs, verbose=TRUE)
+derepRs <- derepFastq(filtRs, verbose=TRUE)
+names(derepFs) <- sample.names
+names(derepRs) <- sample.names
+```
+
+```{r}
+# Sample Inference
+# ================
+# run denoising algorithm
+# https://www.nature.com/articles/nmeth.3869#methods
+dadaFs <- dada(derepFs, err=errF, multithread=TRUE)
+dadaRs <- dada(derepRs, err=errR, multithread=TRUE)
+
+dadaFs[[1]]
+```
+## Merge paired reads
+```{r}
+# merge forward and reversed reads to obtain full denoised sequences
+mergers <- mergePairs(dadaFs, derepFs, dadaRs, derepRs, verbose=TRUE)
+
+# Inspect the merger data.frame from the first sample
+head(mergers[[1]])
+
+View(mergers)
+```
+
+## Construct sequence table
+```{r}
+# construct amplicon sequence variant (ASV) table (ASV = high resolution OTU)
+seqtab <- makeSequenceTable(mergers)
+dim(seqtab)
+
+# distribution of sequence lengths
+table(nchar(getSequences(seqtab)))
+hist(nchar(getSequences(seqtab)))
+```
+## Remove chimeras
+```{r}
+# NB: to "cut out" only sequences of an expected length range:
+# seqtab2 <- seqtab[,nchar(colnames(seqtab)) %in% seq(250,256)]
+
+# easy to identify chimeras since they can be assembled from a left-segment + right-segment
+# of two more abundant parents
+# NB: bimera = chimera of 2 sequences
+seqtab.nochim <- removeBimeraDenovo(seqtab, method="consensus", multithread=TRUE, verbose=TRUE)
+
+# how many chimera sequences were identified?
+ncol(seqtab) - ncol(seqtab.nochim)
+# ...as a fraction of the total number of unique sequences
+(ncol(seqtab) - ncol(seqtab.nochim))/ncol(seqtab)
+
+# but accounting for abundance, how much of the sequence information was rejected
+# as chimera?
+(1 - sum(seqtab.nochim)/sum(seqtab))
+```
+
+## Track reads through the pipeline
+```{r}
+# how many sequences were lost at each step of the analysis?
+getN <- function(x) sum(getUniques(x))
+track <- cbind(out, sapply(dadaFs, getN), sapply(dadaRs, getN), sapply(mergers, getN), rowSums(seqtab.nochim))
+colnames(track) <- c("input", "filtered", "denoisedF", "denoisedR", "merged", "nonchim")
+rownames(track) <- sample.names
+head(track)
+
+# good, most of the sequences made it thru the whole analysis
+```
+
+```{r}
+library(tidyr)
+library(magrittr)
+library(dplyr)
+library(tibble)
+
+gather(data.frame(track), input, filtered, denoisedF, denoisedR, merged, nonchim)
+# ggplot(track, mapping = aes(x=))
+
+track_tbl <- track %>% as.tibble(rownames="sample") %>% gather(keys=c(input,filtered,denoisedF,denoisedR,merged,nonchim))
+
+ggplot(track_tbl, mapping = aes(x=key,y=value,color=sample,group=sample)) + 
+  geom_line()
+```
+
+## Assign taxonomy
+```{r}
+taxa <- assignTaxonomy(seqtab.nochim, taxonomy_train_path, multithread=TRUE)
+taxa <- addSpecies(taxa, taxonomy_species_path)
+
+# create a copy with rownames removed for display purposes
+taxa.print <- taxa 
+rownames(taxa.print) <- NULL
+head(taxa.print)
+```
+
+## Evaluate accuracy
+
+Haven't figured out how this applies yet for our data...
+
+```{r}
+# unqs.mock <- seqtab.nochim["Mock",]
+# unqs.mock <- sort(unqs.mock[unqs.mock>0], decreasing=TRUE) # Drop ASVs absent in the Mock
+# cat("DADA2 inferred", length(unqs.mock), "sample sequences present in the Mock community.\n")
+# 
+# 
+# mock.ref <- getSequences(file.path(path, "HMP_MOCK.v35.fasta"))
+# match.ref <- sum(sapply(names(unqs.mock), function(x) any(grepl(x, mock.ref))))
+# cat("Of those,", sum(match.ref), "were exact matches to the expected reference sequences.\n")
+```
+
+
+## Visualization
+### Handoff to phyloseq
+Todo...
+
+```{r}
+library(phyloseq); packageVersion("phyloseq")
+library(ggplot2); packageVersion("ggplot2")
+library(ggplot2); packageVersion("ggplot2")
+
+# construct data.frame based on filenames
+# (normally would join to a mapfile containing metadata)
+samples.out <- rownames(seqtab.nochim)
+subject <- sapply(strsplit(samples.out, "D"), `[`, 1)
+gender <- substr(subject,1,1)
+subject <- substr(subject,2,999)
+day <- as.integer(sapply(strsplit(samples.out, "D"), `[`, 2))
+
+# data.frame containing subject information
+samdf <- data.frame(Subject=subject, Gender=gender, Day=day)
+samdf$When <- "Early"
+samdf$When[samdf$Day>100] <- "Late"
+# 
+rownames(samdf) <- samples.out
+
+# construct phyloseq object from dada2 outputs (seqtab.nochim)
+ps <- phyloseq(otu_table(seqtab.nochim, taxa_are_rows=FALSE), 
+               sample_data(samdf), 
+               tax_table(taxa))
+ps <- prune_samples(sample_names(ps) != "Mock", ps) # Remove mock sample
+ps
+
+# plot alpha-diversity
+plot_richness(ps, x="Day", measures=c("Shannon", "Simpson"), color="When")
+
+
+# Transform data to proportions as appropriate for Bray-Curtis distances
+ps.prop <- transform_sample_counts(ps, function(otu) otu/sum(otu))
+ord.nmds.bray <- ordinate(ps.prop, method="NMDS", distance="bray")
+
+plot_ordination(ps.prop, ord.nmds.bray, color="When", title="Bray NMDS")
+
+# bar plot of taxa
+top20 <- names(sort(taxa_sums(ps), decreasing=TRUE))[1:20]
+ps.top20 <- transform_sample_counts(ps, function(OTU) OTU/sum(OTU))
+ps.top20 <- prune_taxa(top20, ps.top20)
+plot_bar(ps.top20, x="Day", fill="Family") + facet_wrap(~When, scales="free_x")
+```
+
+
+Save data to resume later
+```{r}
+save(dadaFs,dadaRs,derepFs,derepRs,errF,errR,mergers,seqtab,seqtab.nochim,taxa, file = file.path(path, "analysis", "analysis.Rdata"))
+```
+
+******************************************************************************
+
+# Training linear model
+
+```{r}
+install.packages('lme4')
+load('./RepRefine_Scripts/input/processed.rda')
+```
+
+```{r}
+library(dplyr)
+library(tibble)
+library(lme4)
+```
+
+```{r}
+# convert ASV count matrix to data.frame
+st_df<-cbind(rownames(st),data.frame(st))
+names(st_df)[names(st_df)=='rownames(st)']<-'SampleID'
+
+# merge ASV with dataframe
+df_asv <- inner_join(x = df, y = st_df, by = 'SampleID')
+```
+```{r}
+for (asv in colnames(st)) {
+  
+}
+```
+
